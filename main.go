@@ -14,21 +14,21 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip59"
 )
 
-type UserConnection struct {
-	conn       *websocket.Conn
-	lastSeen   time.Time
-	mu         sync.Mutex
-	userPubKey string
-	messages   chan string
-	ctx        context.Context
-	cancel     context.CancelFunc
+type Session struct {
+	conn     *websocket.Conn
+	lastSeen time.Time
+	mu       sync.Mutex
+	pubkey   string
+	messages chan string
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 var (
-	userConnections = make(map[string]*UserConnection)
-	connMu          sync.RWMutex
-	kelayPrivKey    string
-	kelayPubKey     string
+	sessions     = make(map[string]*Session)
+	connMu       sync.RWMutex
+	kelayPrivKey string
+	kelayPubKey  string
 )
 
 func main() {
@@ -121,55 +121,57 @@ func processEnvelope(ctx context.Context, envelope *nostr.Event, relayBackend st
 		return
 	}
 
-	userPubKey := innerEvent.PubKey
+	pubkey := innerEvent.PubKey
 
 	// Get or create connection for this user
-	userConn := getOrCreateUserConnection(ctx, userPubKey, relayBackend, brokerConns)
-	if userConn == nil {
+	session := getOrCreateSession(ctx, pubkey, relayBackend, brokerConns)
+	if session == nil {
 		return
 	}
 
+	log.Printf("Forwarding message from %s: %s\n", pubkey, innerEvent.Content)
+
 	// Forward the message to backend relay
-	userConn.mu.Lock()
-	err = userConn.conn.WriteMessage(websocket.TextMessage, []byte(innerEvent.Content))
-	userConn.mu.Unlock()
+	session.mu.Lock()
+	err = session.conn.WriteMessage(websocket.TextMessage, []byte(innerEvent.Content))
+	session.mu.Unlock()
 	if err != nil {
 		log.Printf("Failed to write to backend relay: %v", err)
 		return
 	}
 }
 
-func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend string, brokerConns []*nostr.Relay) *UserConnection {
+func getOrCreateSession(ctx context.Context, pubkey, relayBackend string, brokerConns []*nostr.Relay) *Session {
 	connMu.Lock()
 	defer connMu.Unlock()
 
-	if conn, exists := userConnections[userPubKey]; exists {
-		conn.mu.Lock()
-		conn.lastSeen = time.Now()
-		conn.mu.Unlock()
-		return conn
+	if session, exists := sessions[pubkey]; exists {
+		session.mu.Lock()
+		session.lastSeen = time.Now()
+		session.mu.Unlock()
+		return session
 	}
 
 	// Create new WebSocket connection
 	dialer := websocket.DefaultDialer
 	conn, _, err := dialer.Dial(relayBackend, nil)
 	if err != nil {
-		log.Printf("Failed to connect to backend relay for user %s: %v", userPubKey, err)
+		log.Printf("Failed to connect to backend relay for user %s: %v", pubkey, err)
 		return nil
 	}
 
 	// Create a context for this connection
 	connCtx, cancel := context.WithCancel(ctx)
 
-	userConn := &UserConnection{
-		conn:       conn,
-		lastSeen:   time.Now(),
-		userPubKey: userPubKey,
-		messages:   make(chan string, 100),
-		ctx:        connCtx,
-		cancel:     cancel,
+	session := &Session{
+		conn:     conn,
+		lastSeen: time.Now(),
+		pubkey:   pubkey,
+		messages: make(chan string, 100),
+		ctx:      connCtx,
+		cancel:   cancel,
 	}
-	userConnections[userPubKey] = userConn
+	sessions[pubkey] = session
 
 	// Start goroutine to read messages from WebSocket
 	go func() {
@@ -177,7 +179,7 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 			cancel()
 			conn.Close()
 			connMu.Lock()
-			delete(userConnections, userPubKey)
+			delete(sessions, pubkey)
 			connMu.Unlock()
 		}()
 
@@ -185,15 +187,15 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket error for user %s: %v", userPubKey, err)
+					log.Printf("WebSocket error for user %s: %v", pubkey, err)
 				} else {
-  				log.Println(err)
+					log.Println(err)
 				}
 				return
 			}
 
 			select {
-			case userConn.messages <- string(message):
+			case session.messages <- string(message):
 			case <-connCtx.Done():
 				return
 			}
@@ -201,19 +203,19 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 	}()
 
 	// Start handler for backend responses
-	go handleBackendResponses(connCtx, userConn, brokerConns)
+	go handleBackendResponses(connCtx, session, brokerConns)
 
-	return userConn
+	return session
 }
 
-func handleBackendResponses(ctx context.Context, userConn *UserConnection, brokerConns []*nostr.Relay) {
+func handleBackendResponses(ctx context.Context, session *Session, brokerConns []*nostr.Relay) {
 	for {
 		select {
-		case message := <-userConn.messages:
+		case message := <-session.messages:
 			// Update last seen time
-			userConn.mu.Lock()
-			userConn.lastSeen = time.Now()
-			userConn.mu.Unlock()
+			session.mu.Lock()
+			session.lastSeen = time.Now()
+			session.mu.Unlock()
 
 			// Create kind 1508 event
 			rumor := nostr.Event{
@@ -226,16 +228,17 @@ func handleBackendResponses(ctx context.Context, userConn *UserConnection, broke
 
 			// Encrypt function for gift wrap
 			thisEncrypt := func(plaintext string) (string, error) {
-				return encrypt(userConn.userPubKey, plaintext)
+				return encrypt(session.pubkey, plaintext)
 			}
 
 			// Modify function for gift wrap
 			modify := func(event *nostr.Event) {
 				event.Kind = 21059
+				event.CreatedAt = nostr.Now()
 			}
 
 			// Wrap in kind 21059
-			wrapped, err := nip59.GiftWrap(rumor, userConn.userPubKey, thisEncrypt, sign, modify)
+			wrapped, err := nip59.GiftWrap(rumor, session.pubkey, thisEncrypt, sign, modify)
 			if err != nil {
 				log.Printf("Failed to wrap response: %v", err)
 				continue
@@ -282,12 +285,12 @@ func cleanupConnections() {
 		connMu.Lock()
 		now := time.Now()
 
-		for pubkey, conn := range userConnections {
+		for pubkey, conn := range sessions {
 			conn.mu.Lock()
 			if now.Sub(conn.lastSeen) > 30*time.Second {
 				conn.cancel()
 				conn.conn.Close()
-				delete(userConnections, pubkey)
+				delete(sessions, pubkey)
 				log.Printf("Closed inactive connection for user %s", pubkey)
 			}
 			conn.mu.Unlock()
