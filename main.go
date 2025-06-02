@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"os"
 	"strings"
@@ -10,14 +9,15 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip04"
+	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip59"
 )
 
 type UserConnection struct {
-	conn     *nostr.Relay
-	lastSeen time.Time
-	mu       sync.Mutex
+	conn       *nostr.Relay
+	lastSeen   time.Time
+	mu         sync.Mutex
+	userPubKey string
 }
 
 var (
@@ -105,7 +105,7 @@ func handleBrokerEvents(ctx context.Context, sub *nostr.Subscription, relayBacke
 
 func processEnvelope(ctx context.Context, envelope *nostr.Event, relayBackend string, brokerConns []*nostr.Relay) {
 	// Unwrap the kind 21059 envelope
-	innerEvent, err := nip59.Unwrap(envelope, kelayPrivKey)
+	innerEvent, err := nip59.GiftUnwrap(*envelope, decrypt)
 	if err != nil {
 		log.Printf("Failed to unwrap envelope: %v", err)
 		return
@@ -125,19 +125,11 @@ func processEnvelope(ctx context.Context, envelope *nostr.Event, relayBackend st
 		return
 	}
 
-	// Update last seen time
-	userConn.mu.Lock()
-	userConn.lastSeen = time.Now()
-	userConn.mu.Unlock()
-
 	// Forward the message to backend relay
 	if err := userConn.conn.Write([]byte(innerEvent.Content)); err != nil {
 		log.Printf("Failed to write to backend relay: %v", err)
 		return
 	}
-
-	// Handle responses from backend relay
-	go handleBackendResponses(ctx, userConn, userPubKey, brokerConns)
 }
 
 func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend string) *UserConnection {
@@ -145,10 +137,12 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 	defer connMu.Unlock()
 
 	if conn, exists := userConnections[userPubKey]; exists {
+		conn.lastSeen = time.Now()
 		return conn
 	}
 
 	// Create new connection
+	// TODO: instead of using nostr.Relay, use a raw websocket connection
 	relay, err := nostr.RelayConnect(ctx, relayBackend)
 	if err != nil {
 		log.Printf("Failed to connect to backend relay for user %s: %v", userPubKey, err)
@@ -156,30 +150,44 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 	}
 
 	userConn := &UserConnection{
-		conn:     relay,
-		lastSeen: time.Now(),
+		conn:       relay,
+		lastSeen:   time.Now(),
+		userPubKey: userPubKey,
 	}
 	userConnections[userPubKey] = userConn
+
+	// TODO: when the relay disconnects, remove it from userConnections
 
 	return userConn
 }
 
-func handleBackendResponses(ctx context.Context, userConn *UserConnection, userPubKey string, brokerConns []*nostr.Relay) {
+func handleBackendResponses(ctx context.Context, userConn *UserConnection, brokerConns []*nostr.Relay) {
 	for {
 		select {
-		case msg := <-userConn.conn.IncomingEvents:
+		case message := <-userConn.conn.Messages:
 			// Create kind 1508 event
-			responseEvent := nostr.Event{
+			rumor := nostr.Event{
 				Kind:      1508,
 				CreatedAt: nostr.Now(),
-				Content:   msg.String(),
+				Content:   message,
 			}
-			responseEvent.Sign(kelayPrivKey)
+
+			sign(&rumor)
+
+			// Encrypt function for gift wrap
+			thisEncrypt := func(plaintext string) (string, error) {
+				return encrypt(userConn.userPubKey, plaintext)
+			}
+
+			// Modify function for gift wrap
+			modify := func(event *nostr.Event) {
+				event.Kind = 21059
+			}
 
 			// Wrap in kind 21059
-			wrapped, err := nip59.Seal(&responseEvent, userPubKey, kelayPrivKey)
+			wrapped, err := nip59.GiftWrap(rumor, userConn.userPubKey, thisEncrypt, sign, modify)
 			if err != nil {
-				log.Printf("Failed to seal response: %v", err)
+				log.Printf("Failed to wrap response: %v", err)
 				continue
 			}
 
@@ -194,6 +202,26 @@ func handleBackendResponses(ctx context.Context, userConn *UserConnection, userP
 			return
 		}
 	}
+}
+
+func sign(event *nostr.Event) error {
+	return event.Sign(kelayPrivKey)
+}
+
+func encrypt(otherpubkey, plaintext string) (string, error) {
+	conversationKey, err := nip44.GenerateConversationKey(otherpubkey, kelayPrivKey)
+	if err != nil {
+		return "", err
+	}
+	return nip44.Encrypt(plaintext, conversationKey)
+}
+
+func decrypt(otherpubkey, ciphertext string) (string, error) {
+	conversationKey, err := nip44.GenerateConversationKey(otherpubkey, kelayPrivKey)
+	if err != nil {
+		return "", err
+	}
+	return nip44.Decrypt(ciphertext, conversationKey)
 }
 
 func cleanupConnections() {
