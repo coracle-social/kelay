@@ -8,16 +8,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip59"
 )
 
 type UserConnection struct {
-	conn       *nostr.Relay
+	conn       *websocket.Conn
 	lastSeen   time.Time
 	mu         sync.Mutex
 	userPubKey string
+	messages   chan string
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 var (
@@ -120,43 +124,84 @@ func processEnvelope(ctx context.Context, envelope *nostr.Event, relayBackend st
 	userPubKey := innerEvent.PubKey
 
 	// Get or create connection for this user
-	userConn := getOrCreateUserConnection(ctx, userPubKey, relayBackend)
+	userConn := getOrCreateUserConnection(ctx, userPubKey, relayBackend, brokerConns)
 	if userConn == nil {
 		return
 	}
 
 	// Forward the message to backend relay
-	if err := userConn.conn.Write([]byte(innerEvent.Content)); err != nil {
+	userConn.mu.Lock()
+	err = userConn.conn.WriteMessage(websocket.TextMessage, []byte(innerEvent.Content))
+	userConn.mu.Unlock()
+	if err != nil {
 		log.Printf("Failed to write to backend relay: %v", err)
 		return
 	}
 }
 
-func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend string) *UserConnection {
+func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend string, brokerConns []*nostr.Relay) *UserConnection {
 	connMu.Lock()
 	defer connMu.Unlock()
 
 	if conn, exists := userConnections[userPubKey]; exists {
+		conn.mu.Lock()
 		conn.lastSeen = time.Now()
+		conn.mu.Unlock()
 		return conn
 	}
 
-	// Create new connection
-	// TODO: instead of using nostr.Relay, use a raw websocket connection
-	relay, err := nostr.RelayConnect(ctx, relayBackend)
+	// Create new WebSocket connection
+	dialer := websocket.DefaultDialer
+	conn, _, err := dialer.Dial(relayBackend, nil)
 	if err != nil {
 		log.Printf("Failed to connect to backend relay for user %s: %v", userPubKey, err)
 		return nil
 	}
 
+	// Create a context for this connection
+	connCtx, cancel := context.WithCancel(ctx)
+
 	userConn := &UserConnection{
-		conn:       relay,
+		conn:       conn,
 		lastSeen:   time.Now(),
 		userPubKey: userPubKey,
+		messages:   make(chan string, 100),
+		ctx:        connCtx,
+		cancel:     cancel,
 	}
 	userConnections[userPubKey] = userConn
 
-	// TODO: when the relay disconnects, remove it from userConnections
+	// Start goroutine to read messages from WebSocket
+	go func() {
+		defer func() {
+			cancel()
+			conn.Close()
+			connMu.Lock()
+			delete(userConnections, userPubKey)
+			connMu.Unlock()
+		}()
+
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("WebSocket error for user %s: %v", userPubKey, err)
+				} else {
+  				log.Println(err)
+				}
+				return
+			}
+
+			select {
+			case userConn.messages <- string(message):
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
+
+	// Start handler for backend responses
+	go handleBackendResponses(connCtx, userConn, brokerConns)
 
 	return userConn
 }
@@ -164,7 +209,12 @@ func getOrCreateUserConnection(ctx context.Context, userPubKey, relayBackend str
 func handleBackendResponses(ctx context.Context, userConn *UserConnection, brokerConns []*nostr.Relay) {
 	for {
 		select {
-		case message := <-userConn.conn.Messages:
+		case message := <-userConn.messages:
+			// Update last seen time
+			userConn.mu.Lock()
+			userConn.lastSeen = time.Now()
+			userConn.mu.Unlock()
+
 			// Create kind 1508 event
 			rumor := nostr.Event{
 				Kind:      1508,
@@ -235,6 +285,7 @@ func cleanupConnections() {
 		for pubkey, conn := range userConnections {
 			conn.mu.Lock()
 			if now.Sub(conn.lastSeen) > 30*time.Second {
+				conn.cancel()
 				conn.conn.Close()
 				delete(userConnections, pubkey)
 				log.Printf("Closed inactive connection for user %s", pubkey)
