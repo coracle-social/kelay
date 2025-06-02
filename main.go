@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip44"
 	"github.com/nbd-wtf/go-nostr/nip59"
@@ -29,9 +30,16 @@ var (
 	connMu       sync.RWMutex
 	kelayPrivKey string
 	kelayPubKey  string
+	seenEvents   = make(map[string]time.Time)
+	seenEventsMu sync.RWMutex
 )
 
 func main() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Printf("No .env file found: %v", err)
+	}
+
 	// Read environment variables
 	brokerRelaysStr := os.Getenv("BROKER_RELAYS")
 	if brokerRelaysStr == "" {
@@ -97,17 +105,32 @@ func main() {
 	// Start connection cleanup routine
 	go cleanupConnections()
 
+	// Start seen events cleanup routine
+	go cleanupSeenEvents()
+
 	// Keep the program running
 	select {}
 }
 
 func handleBrokerEvents(ctx context.Context, sub *nostr.Subscription, relayBackend string, brokerConns []*nostr.Relay) {
 	for ev := range sub.Events {
+		log.Printf("Received kind 21059 event from broker")
 		go processEnvelope(ctx, ev, relayBackend, brokerConns)
 	}
 }
 
 func processEnvelope(ctx context.Context, envelope *nostr.Event, relayBackend string, brokerConns []*nostr.Relay) {
+	// Check if we've already seen this event
+	eventID := envelope.ID
+	seenEventsMu.Lock()
+	if _, seen := seenEvents[eventID]; seen {
+		seenEventsMu.Unlock()
+		log.Printf("Ignoring duplicate event %s", eventID)
+		return
+	}
+	seenEvents[eventID] = time.Now()
+	seenEventsMu.Unlock()
+
 	// Unwrap the kind 21059 envelope
 	innerEvent, err := nip59.GiftUnwrap(*envelope, decrypt)
 	if err != nil {
@@ -149,6 +172,7 @@ func getOrCreateSession(ctx context.Context, pubkey, relayBackend string, broker
 		session.mu.Lock()
 		session.lastSeen = time.Now()
 		session.mu.Unlock()
+		log.Printf("Using existing session for user %s", pubkey)
 		return session
 	}
 
@@ -176,6 +200,7 @@ func getOrCreateSession(ctx context.Context, pubkey, relayBackend string, broker
 	// Start goroutine to read messages from WebSocket
 	go func() {
 		defer func() {
+			log.Printf("Closing session for user %s", pubkey)
 			cancel()
 			conn.Close()
 			connMu.Lock()
@@ -186,17 +211,17 @@ func getOrCreateSession(ctx context.Context, pubkey, relayBackend string, broker
 		for {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket error for user %s: %v", pubkey, err)
-				} else {
-					log.Println(err)
-				}
+				log.Printf("read error for user %s: %v", pubkey, err)
 				return
 			}
 
+			log.Printf("Read message from backend for user %s: %s", pubkey, string(message))
+
 			select {
 			case session.messages <- string(message):
+				log.Printf("Queued message for processing for user %s", pubkey)
 			case <-connCtx.Done():
+				log.Printf("Context cancelled for user %s", pubkey)
 				return
 			}
 		}
@@ -205,6 +230,7 @@ func getOrCreateSession(ctx context.Context, pubkey, relayBackend string, broker
 	// Start handler for backend responses
 	go handleBackendResponses(connCtx, session, brokerConns)
 
+	log.Printf("Created new session for user %s", pubkey)
 	return session
 }
 
@@ -212,6 +238,8 @@ func handleBackendResponses(ctx context.Context, session *Session, brokerConns [
 	for {
 		select {
 		case message := <-session.messages:
+			log.Printf("Processing backend response for user %s: %s", session.pubkey, message)
+
 			// Update last seen time
 			session.mu.Lock()
 			session.lastSeen = time.Now()
@@ -224,7 +252,10 @@ func handleBackendResponses(ctx context.Context, session *Session, brokerConns [
 				Content:   message,
 			}
 
-			sign(&rumor)
+			if err := sign(&rumor); err != nil {
+				log.Printf("Failed to sign rumor: %v", err)
+				continue
+			}
 
 			// Encrypt function for gift wrap
 			thisEncrypt := func(plaintext string) (string, error) {
@@ -244,10 +275,14 @@ func handleBackendResponses(ctx context.Context, session *Session, brokerConns [
 				continue
 			}
 
+			log.Printf("Successfully wrapped response for user %s", session.pubkey)
+
 			// Send to all broker relays
 			for _, relay := range brokerConns {
 				if err := relay.Publish(ctx, wrapped); err != nil {
 					log.Printf("Failed to publish to broker relay %s: %v", relay.URL, err)
+				} else {
+					log.Printf("Successfully published response to broker relay %s for user %s", relay.URL, session.pubkey)
 				}
 			}
 
@@ -297,5 +332,25 @@ func cleanupConnections() {
 		}
 
 		connMu.Unlock()
+	}
+}
+
+func cleanupSeenEvents() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		seenEventsMu.Lock()
+		now := time.Now()
+
+		for eventID, seenTime := range seenEvents {
+			// Remove events older than 10 minutes
+			if now.Sub(seenTime) > 10*time.Minute {
+				delete(seenEvents, eventID)
+			}
+		}
+
+		log.Printf("Cleaned up seen events, current count: %d", len(seenEvents))
+		seenEventsMu.Unlock()
 	}
 }
